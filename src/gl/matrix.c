@@ -35,6 +35,15 @@ void gl4es_mvp_restore(const gl4es_mvp_save_t *s)
     gl4es_mat_mark_dirty();
 }
 
+void gl4es_mvp_load_identity(void)
+{
+    set_identity(getMVMat());
+    set_identity(getPMat());
+    glstate->modelview_matrix->identity = 1;
+    glstate->projection_matrix->identity = 1;
+    gl4es_mat_mark_dirty();
+}
+
 void gl4es_mvp_poke_proj_zbias(GLfloat d)
 {
     GLfloat *P = getPMat();
