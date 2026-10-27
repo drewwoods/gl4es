@@ -272,6 +272,8 @@ typedef struct {
     GLboolean       deferred;
     GLboolean       deferred_scissor;
     GLint           deferred_scissor_box[4];
+    int             sample_x, sample_y;
+    int             sample_width, sample_height;
     int             width, height;
     GLfloat         clear[4];       // glClearAccum value
     // private scaled-copy program
