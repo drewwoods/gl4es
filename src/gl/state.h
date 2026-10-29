@@ -265,6 +265,7 @@ typedef struct {
     GLuint          fbo;
     GLuint          accum_tex;
     GLuint          scratch_tex;    // framebuffer snapshot for GL_ACCUM/GL_LOAD
+    GLuint          one_tex;        // 1x1 white, scaled into GL_ADD/GL_MULT's constant
     GLuint          sample_tex[GL4ES_ACCUM_MAX_DEFERRED_SAMPLES];
     GLfloat         sample_weight[GL4ES_ACCUM_MAX_DEFERRED_SAMPLES];
     int             sample_count;

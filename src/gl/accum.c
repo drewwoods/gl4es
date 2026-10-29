@@ -11,8 +11,11 @@
  *   glAccum(GL_RETURN, s)         -> reduce the deferred snapshots in one
  *                                    fullscreen shader and return the result
  *                                    scaled by s
- *   GL_ADD / GL_MULT              -> TODO (unused by fixed-function apps
- *                                    hosted so far)
+ *   glAccum(GL_MULT, v)           -> scale a deferred batch's weights by v,
+ *                                    else blend a quad of the constant v
+ *                                    into the accum FBO as a multiply
+ *   glAccum(GL_ADD, v)            -> commit a deferred batch, then blend the
+ *                                    constant quad in as an add
  *
  * GL_ACCUM without a preceding GL_LOAD, batches beyond the available sampler
  * count, and state patterns that invalidate a deferred batch fall back to the
@@ -634,6 +637,15 @@ static int accum_ensure(glesaccum_t *a) {
     gles_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     gles_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     gles_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+    if(!a->one_tex) {
+        // sampled as 1 and scaled by the shader: GL_ADD's and GL_MULT's value
+        static const GLubyte white[4] = {255, 255, 255, 255};
+        gles_glGenTextures(1, &a->one_tex);
+        gles_glBindTexture(GL_TEXTURE_2D, a->one_tex);
+        gles_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        gles_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        gles_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, white);
+    }
     gles_glBindTexture(GL_TEXTURE_2D, glstate->actual_tex2d[0]);
 
     gles_glGenFramebuffers(1, &a->fbo);
@@ -938,6 +950,8 @@ void gl4es_accum_dispose(void *accum) {
             gles_glDeleteTextures(1, &a->accum_tex);
         if(a->scratch_tex && gles_glDeleteTextures)
             gles_glDeleteTextures(1, &a->scratch_tex);
+        if(a->one_tex && gles_glDeleteTextures)
+            gles_glDeleteTextures(1, &a->one_tex);
         if(gles_glDeleteTextures) {
             for(int i=0; i<GL4ES_ACCUM_MAX_DEFERRED_SAMPLES; i++)
                 if(a->sample_tex[i])
@@ -1011,18 +1025,9 @@ void APIENTRY_GL4ES gl4es_glAccum(GLenum op, GLfloat value) {
         case GL_ACCUM:
         case GL_LOAD:
         case GL_RETURN:
-            break;
         case GL_ADD:
-        case GL_MULT: {
-            // TODO: unused by the fixed-function apps hosted so far
-            static int warned = 0;
-            if(!warned) {
-                warned = 1;
-                SHUT_LOGD("Accum buffer emulation: GL_ADD/GL_MULT not implemented\n");
-            }
-            noerrorShim();
-            return;
-        }
+        case GL_MULT:
+            break;
         default:
             errorShim(GL_INVALID_ENUM);
             return;
@@ -1071,6 +1076,15 @@ void APIENTRY_GL4ES gl4es_glAccum(GLenum op, GLfloat value) {
         /* Changed scissor or full sampler batch: establish the accumulated
          * value once, then handle this sample through the immediate path. */
         accum_materialize_deferred(a);
+    } else if(op==GL_MULT && a->deferred && accum_scissor_matches(a)) {
+        /* The batch is the weighted sum of its snapshots, so multiplying it
+         * multiplies the weights. */
+        for(int i=0; i<a->sample_count; i++)
+            a->sample_weight[i] *= value;
+        goto accum_done;
+    } else if(op==GL_ADD || op==GL_MULT) {
+        // GL_ADD, or GL_MULT under another scissor, needs the batch committed
+        accum_materialize_deferred(a);
     }
 
     if(op==GL_RETURN) {
@@ -1089,6 +1103,27 @@ void APIENTRY_GL4ES gl4es_glAccum(GLenum op, GLfloat value) {
             accum_draw_quad(a, a->accum_tex, value);
             popViewport();
         }
+    } else if(op==GL_ADD || op==GL_MULT) {
+        /* A quad of the constant value, blended into the accum FBO as
+         * dst*value or dst+value. A negative GL_ADD subtracts -value
+         * instead, which works on an 8-bit target too, whose output clamps
+         * to [0, 1]; there GL_MULT's value clamps to [0, 1] as well. */
+        LOAD_GLES2_OR_OES(glBindFramebuffer);
+        gles_glBindFramebuffer(GL_FRAMEBUFFER, a->fbo);
+        gl4es_glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        gl4es_glEnable(GL_BLEND);
+        gl4es_glDisable(GL_COLOR_LOGIC_OP);
+        if(op==GL_MULT) {
+            gl4es_glBlendFunc(GL_ZERO, GL_SRC_COLOR);
+            gl4es_glBlendEquation(GL_FUNC_ADD);
+        } else {
+            gl4es_glBlendFunc(GL_ONE, GL_ONE);
+            gl4es_glBlendEquation((value<0.f)?GL_FUNC_REVERSE_SUBTRACT:GL_FUNC_ADD);
+        }
+        pushViewport(0, 0, a->width, a->height);
+        accum_draw_quad(a, a->one_tex, (op==GL_ADD && value<0.f)?-value:value);
+        popViewport();
+        gl4es_setCurrentFBO();
     } else {
         /* Immediate fallback for ACCUM without LOAD, a failed deferred shader,
          * or the operation that overflowed a deferred sampler batch. */
