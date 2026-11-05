@@ -555,6 +555,8 @@ static int accum_create_reduce_program(glesaccum_t *a) {
     }
     gles_glUseProgram(oldprog);
     a->sample_capacity = capacity;
+    SHUT_LOGD("Accum deferred RETURN reduction active (%d samples)\n",
+              a->sample_capacity);
     return 1;
 }
 
@@ -686,7 +688,8 @@ static int accum_ensure_sample(glesaccum_t *a, int index) {
     gles_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     gles_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     gles_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    gles_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, a->width, a->height,
+    gles_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB,
+                      a->sample_width, a->sample_height,
                       0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
     int ok = (gles_glGetError()==GL_NO_ERROR);
     if(!ok) {
@@ -757,6 +760,42 @@ static void accum_capture_scissor(glesaccum_t *a) {
     a->deferred_scissor_box[1] = glstate->raster.scissor.y;
     a->deferred_scissor_box[2] = glstate->raster.scissor.width;
     a->deferred_scissor_box[3] = glstate->raster.scissor.height;
+    if(a->deferred_scissor) {
+        int x0 = a->deferred_scissor_box[0];
+        int y0 = a->deferred_scissor_box[1];
+        int x1 = x0 + a->deferred_scissor_box[2];
+        int y1 = y0 + a->deferred_scissor_box[3];
+        if(x0 < 0) x0 = 0;
+        if(y0 < 0) y0 = 0;
+        if(x1 > a->width) x1 = a->width;
+        if(y1 > a->height) y1 = a->height;
+        a->sample_x = x0;
+        a->sample_y = y0;
+        a->sample_width = x1 > x0 ? x1 - x0 : 0;
+        a->sample_height = y1 > y0 ? y1 - y0 : 0;
+    } else {
+        a->sample_x = 0;
+        a->sample_y = 0;
+        a->sample_width = a->width;
+        a->sample_height = a->height;
+    }
+}
+
+static int accum_prepare_sample_region(glesaccum_t *a) {
+    int old_width = a->sample_width;
+    int old_height = a->sample_height;
+    accum_capture_scissor(a);
+    if(a->sample_width<1 || a->sample_height<1) return 0;
+    if(old_width==a->sample_width && old_height==a->sample_height) return 1;
+
+    LOAD_GLES(glDeleteTextures);
+    for(int i=0; i<GL4ES_ACCUM_MAX_DEFERRED_SAMPLES; i++) {
+        if(a->sample_tex[i]) {
+            gles_glDeleteTextures(1, &a->sample_tex[i]);
+            a->sample_tex[i] = 0;
+        }
+    }
+    return 1;
 }
 
 static int accum_scissor_matches(const glesaccum_t *a) {
@@ -769,7 +808,8 @@ static int accum_scissor_matches(const glesaccum_t *a) {
         && a->deferred_scissor_box[3] == glstate->raster.scissor.height;
 }
 
-static void accum_snapshot(glesaccum_t *a, GLuint texture) {
+static void accum_snapshot(glesaccum_t *a, GLuint texture,
+                           int x, int y, int width, int height) {
     LOAD_GLES(glBindTexture);
     LOAD_GLES(glCopyTexSubImage2D);
     readfboBegin();
@@ -779,7 +819,7 @@ static void accum_snapshot(glesaccum_t *a, GLuint texture) {
     // (WebGL resolves it first), so natively a multisampled window gets
     // nothing from GL_ACCUM and GL_LOAD; it needs a resolve first
     gles_glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
-                             0, 0, a->width, a->height);
+                             x, y, width, height);
     gles_glBindTexture(GL_TEXTURE_2D, glstate->actual_tex2d[0]);
     readfboEnd();
 }
@@ -842,7 +882,8 @@ static void accum_materialize_deferred(glesaccum_t *a) {
     gles_glBindFramebuffer(GL_FRAMEBUFFER, a->fbo);
     gl4es_glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     gl4es_glDisable(GL_BLEND);
-    pushViewport(0, 0, a->width, a->height);
+    pushViewport(a->sample_x, a->sample_y,
+                 a->sample_width, a->sample_height);
     accum_draw_reduction(a, 1.0f);
     popViewport();
     gl4es_setCurrentFBO();
@@ -860,9 +901,11 @@ static void accum_materialize_deferred(glesaccum_t *a) {
 static int accum_defer_snapshot(glesaccum_t *a, GLfloat weight) {
     if(!a->reduce_program && !accum_create_reduce_program(a)) return 0;
     if(a->sample_count >= a->sample_capacity) return 0;
+    if(a->sample_count==0 && !accum_prepare_sample_region(a)) return 0;
     if(!accum_ensure_sample(a, a->sample_count)) return 0;
-    if(a->sample_count==0) accum_capture_scissor(a);
-    accum_snapshot(a, a->sample_tex[a->sample_count]);
+    accum_snapshot(a, a->sample_tex[a->sample_count],
+                   a->sample_x, a->sample_y,
+                   a->sample_width, a->sample_height);
     a->sample_weight[a->sample_count] = weight;
     a->sample_count++;
     a->deferred = GL_TRUE;
@@ -1032,21 +1075,24 @@ void APIENTRY_GL4ES gl4es_glAccum(GLenum op, GLfloat value) {
 
     if(op==GL_RETURN) {
         gl4es_glDisable(GL_BLEND);
-        pushViewport(0, 0, a->width, a->height);
         if(a->deferred && accum_scissor_matches(a)) {
             /* Common gl-repl path: all weights are applied here, with no
              * per-sample blend into the float accumulation target. */
+            pushViewport(a->sample_x, a->sample_y,
+                         a->sample_width, a->sample_height);
             accum_draw_reduction(a, value);
+            popViewport();
         } else {
             if(a->deferred) accum_materialize_deferred(a);
             // materialized accum texture -> draw framebuffer, scaled by value
+            pushViewport(0, 0, a->width, a->height);
             accum_draw_quad(a, a->accum_tex, value);
+            popViewport();
         }
-        popViewport();
     } else {
         /* Immediate fallback for ACCUM without LOAD, a failed deferred shader,
          * or the operation that overflowed a deferred sampler batch. */
-        accum_snapshot(a, a->scratch_tex);
+        accum_snapshot(a, a->scratch_tex, 0, 0, a->width, a->height);
 
         LOAD_GLES2_OR_OES(glBindFramebuffer);
         gles_glBindFramebuffer(GL_FRAMEBUFFER, a->fbo);
