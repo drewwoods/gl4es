@@ -251,6 +251,8 @@ typedef struct {
     GLfloat         vert[8], tex[8];
 } glesblit_t;
 
+#define GL4ES_ACCUM_MAX_DEFERRED_SAMPLES 16
+
 // accumulation-buffer emulation state (accum.c)
 typedef struct {
     // one-time renderability probe
@@ -263,6 +265,13 @@ typedef struct {
     GLuint          fbo;
     GLuint          accum_tex;
     GLuint          scratch_tex;    // framebuffer snapshot for GL_ACCUM/GL_LOAD
+    GLuint          sample_tex[GL4ES_ACCUM_MAX_DEFERRED_SAMPLES];
+    GLfloat         sample_weight[GL4ES_ACCUM_MAX_DEFERRED_SAMPLES];
+    int             sample_count;
+    int             sample_capacity;
+    GLboolean       deferred;
+    GLboolean       deferred_scissor;
+    GLint           deferred_scissor_box[4];
     int             width, height;
     GLfloat         clear[4];       // glClearAccum value
     // private scaled-copy program
@@ -270,6 +279,13 @@ typedef struct {
     GLuint          pixelshader;
     GLuint          program;
     GLint           uscale;
+    // deferred weighted-reduction program
+    GLuint          reduce_pixelshader;
+    GLuint          reduce_program;
+    int             reduce_failed;  /* sticky: do not retry a failed reduce shader */
+    GLint           reduce_uscale;
+    GLint           reduce_tex[GL4ES_ACCUM_MAX_DEFERRED_SAMPLES];
+    GLint           reduce_weight[GL4ES_ACCUM_MAX_DEFERRED_SAMPLES];
     GLfloat         vert[8], tex[8];
 } glesaccum_t;
 
